@@ -19,10 +19,12 @@ package org.jboss.as.arquillian.container;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -38,6 +40,8 @@ import org.jboss.arquillian.test.spi.event.suite.AfterClass;
 import org.jboss.arquillian.test.spi.event.suite.BeforeClass;
 import org.jboss.as.arquillian.api.ServerSetup;
 import org.jboss.as.arquillian.api.ServerSetupTask;
+import org.jboss.as.controller.descriptions.ModelDescriptionConstants;
+import org.jboss.dmr.ModelNode;
 import org.jboss.logging.Logger;
 
 /**
@@ -59,6 +63,7 @@ public class ServerSetupObserver {
     private Instance<ClassContext> classContextInstance;
 
     private final Map<String, ServerSetupTaskHolder> setupTasks = new HashMap<>();
+    private final List<ManagementClient> serversToCheck = new ArrayList<>();
     private boolean afterClassRun = false;
 
     /**
@@ -93,7 +98,7 @@ public class ServerSetupObserver {
         if (classContext == null) {
             return;
         }
-
+        serversToCheck.add(managementClient.get());
         final Class<?> currentClass = classContext.getActiveId();
 
         ServerSetup setup = currentClass.getAnnotation(ServerSetup.class);
@@ -118,22 +123,35 @@ public class ServerSetupObserver {
      * @throws Exception if an error occurs processing the event
      */
     public synchronized void afterTestClass(@Observes AfterClass afterClass) throws Exception {
-        if (setupTasks.isEmpty()) {
-            return;
+        if (!setupTasks.isEmpty()) {
+
+            // Clean up any remaining tasks from unmanaged deployments
+            final Iterator<Map.Entry<String, ServerSetupTaskHolder>> iter = setupTasks.entrySet().iterator();
+            while (iter.hasNext()) {
+                final Map.Entry<String, ServerSetupTaskHolder> entry = iter.next();
+                final ServerSetupTaskHolder holder = entry.getValue();
+                // Only tearDown if all deployments have been removed from the container
+                if (holder.deployments.isEmpty()) {
+                    entry.getValue().tearDown(entry.getKey());
+                    iter.remove();
+                }
+            }
+            afterClassRun = true;
         }
 
-        // Clean up any remaining tasks from unmanaged deployments
-        final Iterator<Map.Entry<String, ServerSetupTaskHolder>> iter = setupTasks.entrySet().iterator();
-        while (iter.hasNext()) {
-            final Map.Entry<String, ServerSetupTaskHolder> entry = iter.next();
-            final ServerSetupTaskHolder holder = entry.getValue();
-            // Only tearDown if all deployments have been removed from the container
-            if (holder.deployments.isEmpty()) {
-                entry.getValue().tearDown(entry.getKey());
-                iter.remove();
+        ModelNode read = new ModelNode();
+        read.get(ModelDescriptionConstants.OP).set(ModelDescriptionConstants.READ_ATTRIBUTE_OPERATION);
+        read.get(ModelDescriptionConstants.NAME).set("server-state");
+        for(ManagementClient server: serversToCheck) {
+            ModelNode result = server.getControllerClient().execute(read);
+            if (result.hasDefined("outcome") && "success".equals(result.get("outcome").asString())) {
+                if (!"running".equals(result.get("result").asString())) {
+                    throw new RuntimeException("Server was not left in 'running' state after test " + result);
+                }
+            } else {
+                throw new RuntimeException("Failed to read process state after test " + result.get("failure-description").toString());
             }
         }
-        afterClassRun = true;
     }
 
     /**
